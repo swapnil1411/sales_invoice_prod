@@ -1,19 +1,19 @@
+# transformer.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mirakl_transformer.py
-Maps Mirakl Order/Refund XML (multiple shapes) to your nested JSON templates.
+Maps Mirakl Order/Refund XML into SIMPLE Mirakl JSON payloads.
 
 Public API:
     map_mirakl_xml_to_template(xml_text: str, mode: str) -> dict
-        mode = "order"  -> returns JSON shaped like ORDER_TEMPLATE_JSON (filled)
-        mode = "refund" -> returns JSON shaped like REFUND_TEMPLATE_JSON (filled)
+        mode = "order"  -> {"orders":  [ {...} ]}
+        mode = "refund" -> {"refunds": [ {...} ]}
 
     transform_payload(folder_key: str, xml_text: str) -> dict | None
-        folder_key in {"mirakl-order", "mirakl-refund"} -> returns filled template
-        else -> None (caller should write payload as-is)
+        folder_key in {"mirakl-order", "mirakl-refund"} -> returns filled payload
+        else -> None (caller should write original payload)
 
-Supported input XML shapes:
+Supported XML shapes:
   1) Sterling-like invoice:
      InvoiceDetail/InvoiceHeader/...
   2) Mirakl order feed body:
@@ -29,121 +29,6 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import xml.etree.ElementTree as ET
-
-
-# ===================== Templates (exactly as provided) =====================
-
-ORDER_TEMPLATE_JSON = r"""{
-    "InvoiceHeader": {
-        "InvoiceNo": "65826232",
-        "Reference1": "ref",
-        "Interco": "12345",
-        "DateInvoiced": 1755653117000,
-        "InvoiceType": "shipment",
-        "Shipment": {
-            "ActualShipmentDate": 1755653117000,
-            "NodeType": "DC",
-            "_ShipNode": "SN001",
-            "ShipmentNo": "SHIP125"
-        },
-        "Order": {
-            "PriceInfo": {
-                "Currency": "USD",
-                "EnterpriseCurrency": "USD",
-                "ReportingConversionRate": 1.0
-            },
-            "PersonInfoBillTo": {
-                "PersonInfoKey": "202501030816177856072195"
-            }
-        },
-        "LineDetails": {
-            "TotalLines": "1",
-            "LineDetail": [
-                {
-                    "LineCharges": {
-                        "LineCharge": [
-                            {
-                                "Lookups": {
-                                    "DiscountAmtABS": "5.00",
-                                    "ChargeTypeDesc": "desc",
-                                    "LineChargeType": "E"
-                                },
-                                "ChargeAmount": "10.00"
-                            }
-                        ]
-                    },
-                    "OrderLine": {
-                        "LineType": "mrkl",
-                        "Extn": {
-                            "ExtnMiraklOrderID": "AP03542309-225112422-A"
-                        }
-                    }
-                }
-            ]
-        },
-        "CollectionDetails": {
-            "CollectionDetail": [
-                {
-                    "AmountCollected": "217.66"
-                }
-            ]
-        }
-    }
-}"""
-
-REFUND_TEMPLATE_JSON = r"""{
-  "InvoiceHeader": {
-    "InvoiceNo": "INV123",
-    "Reference1": "REFUND-12345",
-    "Interco": "TO",
-    "DateInvoiced": 20250725,
-    "InvoiceType": "CREDIT_MEMO",
-    "Shipment": {
-      "ActualShipmentDate": 20250720,
-      "NodeType": "DC",
-      "_ShipNode": "SN001",
-      "ShipmentNo": "SHIP123"
-    },
-    "Order": {
-      "PriceInfo": {
-        "Currency": "USD",
-        "EnterpriseCurrency": "USD",
-        "ReportingConversionRate": 1
-      },
-      "PersonInfoBillTo": {
-        "PersonInfoKey": "P12345"
-      }
-    },
-    "LineDetails": {
-      "TotalLines": "1",
-      "LineDetail": [
-        {
-          "OrderLine": {
-            "LineType": "mrkl",
-            "Extn": {
-              "ExtnMiraklOrderID": "MO12345"
-            },
-            "References": {
-              "Reference": [
-                {
-                  "Name": "RO-ID",
-                  "Value": "MRKL-REF-99999"
-                }
-              ]
-            }
-          }
-        }
-      ]
-    },
-    "CollectionDetails": {
-      "CollectionDetail": [
-        {
-          "AmountCollected": "100.00"
-        }
-      ]
-    }
-  }
-}"""
 
 
 # ===================== XML helpers (namespace-agnostic) =====================
@@ -211,53 +96,49 @@ def _sum_amounts_str(values: List[str], abs_value: bool) -> str:
         total = abs(total)
     return f"{total.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
 
-def _to_epoch_ms(iso_str: str) -> int:
+def _to_iso8601_utc(x: str) -> str:
     """
-    Accept ISO-8601 with offset or 'Z' and return epoch milliseconds.
-    If it's already digits (10 or 13), pass through appropriately.
+    Normalize input date/time into ISO-8601 UTC with offset '+00:00'.
+    Accepts:
+      - epoch ms (>=13 digits)
+      - epoch s (10 digits)
+      - YYYYMMDD (8 digits) -> midnight UTC
+      - ISO strings with 'Z' or timezone offset
     """
-    s = (iso_str or "").strip()
+    if x is None:
+        return ""
+    s = str(x).strip()
     if not s:
-        return 0
+        return ""
+
     if s.isdigit():
-        if len(s) >= 13:
-            return int(s[:13])
-        if len(s) == 10:
-            return int(s) * 1000
-        if len(s) == 8:  # YYYYMMDD -> midnight UTC
-            try:
+        try:
+            if len(s) >= 13:  # epoch ms
+                ms = int(s[:13])
+                dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+                return dt.replace(microsecond=0).isoformat().replace("+00:00", "+00:00")
+            if len(s) == 10:  # epoch seconds
+                sec = int(s)
+                dt = datetime.fromtimestamp(sec, tz=timezone.utc)
+                return dt.replace(microsecond=0).isoformat().replace("+00:00", "+00:00")
+            if len(s) == 8:   # YYYYMMDD
                 dt = datetime.strptime(s, "%Y%m%d").replace(tzinfo=timezone.utc)
-                return int(dt.timestamp() * 1000)
-            except Exception:
-                return 0
+                return dt.replace(microsecond=0).isoformat().replace("+00:00", "+00:00")
+        except Exception:
+            return s
+
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return int(dt.timestamp() * 1000)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt.replace(microsecond=0).isoformat()
     except Exception:
-        return 0
-
-def _to_yyyymmdd_int(iso_str: str) -> int:
-    s = (iso_str or "").strip()
-    if not s:
-        return 0
-    if s.isdigit():
-        if len(s) == 8:
-            return int(s)
-        if len(s) >= 13:
-            ms = int(s[:13])
-            dt = datetime.fromtimestamp(ms/1000, tz=timezone.utc)
-            return int(dt.strftime("%Y%m%d"))
-        if len(s) == 10:
-            dt = datetime.fromtimestamp(int(s), tz=timezone.utc)
-            return int(dt.strftime("%Y%m%d"))
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return int(dt.strftime("%Y%m%d"))
-    except Exception:
-        return 0
+        return s
 
 
-# ===================== Sterling invoice mappers (Excel rules) =====================
+# ===================== Sterling invoice extractors (Excel rules) =====================
 
 def _invoice_header(root: ET.Element) -> Optional[ET.Element]:
     return _find_first(root, "InvoiceDetail/InvoiceHeader") or _find_first(root, "InvoiceHeader")
@@ -294,257 +175,134 @@ def _invoice_refund_reference_value(header: ET.Element) -> str:
             return _text(_find_first(ref, "Value"))
     return ""
 
-def _map_invoice_to_order_template(root: ET.Element) -> Dict[str, Any]:
-    header = _invoice_header(root)
-    if header is None:
-        return json.loads(ORDER_TEMPLATE_JSON)  # nothing to map
-    amount_str = _sum_amounts_str(_invoice_amounts(header), abs_value=False)
+
+# ===================== SIMPLE payload builders =====================
+
+def _build_order_payload_from_invoice(header: ET.Element) -> Dict[str, Any]:
+    """
+    orders[0] mapping (Excel):
+      amount              = ROUND(SUM(CollectionDetail/AmountCollected),2)
+      currency_iso_code   = Order/PriceInfo/Currency
+      customer_id         = Order/PersonInfoBillTo/PersonInfoKey
+      order_id            = first LineDetails/.../ExtnMiraklOrderID
+      payment_status      = "OK"
+      transaction_date    = Shipment/ActualShipmentDate if present else DateInvoiced
+      transaction_number  = InvoiceNo
+    """
+    amount = _sum_amounts_str(_invoice_amounts(header), abs_value=False)
     currency = _invoice_currency(header)
     customer_id = _invoice_customer_id(header)
     order_id = _invoice_order_id_first_line(header)
-    tx_num = _invoice_invoice_no(header)
-    tx_date_iso = _invoice_tx_date_pref_ship(header)
+    tx_date_iso = _to_iso8601_utc(_invoice_tx_date_pref_ship(header))
+    inv_no = _invoice_invoice_no(header)
 
-    out = json.loads(ORDER_TEMPLATE_JSON)
-    hdr = out["InvoiceHeader"]
+    return {
+        "amount": amount,
+        "currency_iso_code": currency,
+        "customer_id": customer_id,
+        "order_id": order_id,
+        "payment_status": "OK",
+        "transaction_date": tx_date_iso,
+        "transaction_number": inv_no,
+    }
 
-    hdr["InvoiceNo"] = tx_num
-    hdr["DateInvoiced"] = _to_epoch_ms(tx_date_iso)
-    hdr["InvoiceType"] = "shipment"
-
-    ship = hdr.setdefault("Shipment", {})
-    ship["ActualShipmentDate"] = _to_epoch_ms(tx_date_iso)
-    ship["NodeType"] = "DC"
-    ship["_ShipNode"] = "SN001"
-    ship["ShipmentNo"] = order_id
-
-    price = hdr.setdefault("Order", {}).setdefault("PriceInfo", {})
-    price["Currency"] = currency
-    price["EnterpriseCurrency"] = currency
-    price["ReportingConversionRate"] = 1.0
-
-    bill_to = hdr["Order"].setdefault("PersonInfoBillTo", {})
-    bill_to["PersonInfoKey"] = customer_id
-
-    lined = hdr.setdefault("LineDetails", {})
-    lined["TotalLines"] = "1"
-    line0 = lined.setdefault("LineDetail", [{}])[0]
-    ol = line0.setdefault("OrderLine", {})
-    ol["LineType"] = "mrkl"
-    extn = ol.setdefault("Extn", {})
-    extn["ExtnMiraklOrderID"] = order_id
-
-    coll0 = hdr.setdefault("CollectionDetails", {}).setdefault("CollectionDetail", [{}])[0]
-    coll0["AmountCollected"] = amount_str
-
-    return out
-
-def _map_invoice_to_refund_template(root: ET.Element) -> Dict[str, Any]:
-    header = _invoice_header(root)
-    if header is None:
-        return json.loads(REFUND_TEMPLATE_JSON)  # nothing to map
-    amount_str = _sum_amounts_str(_invoice_amounts(header), abs_value=True)
+def _build_refund_payload_from_invoice(header: ET.Element) -> Dict[str, Any]:
+    """
+    refunds[0] mapping (Excel):
+      amount              = ABS(ROUND(SUM(CollectionDetail/AmountCollected),2))
+      currency_iso_code   = Order/PriceInfo/Currency
+      payment_status      = "OK"
+      refund_id           = if UPPER(TRIM(InvoiceType))='CREDIT_MEMO' -> Reference1
+                            else -> first OrderLine/References/Reference[Name in ('RO-ID','MRKL_REFUND_ID')]/Value
+      transaction_date    = DateInvoiced
+      transaction_number  = InvoiceNo
+    Additionally, we include customer_id if available (from PersonInfoBillTo/PersonInfoKey).
+    """
+    amount = _sum_amounts_str(_invoice_amounts(header), abs_value=True)
     currency = _invoice_currency(header)
-    tx_num = _invoice_invoice_no(header)
     inv_type = (_invoice_type(header) or "").strip().upper()
     if inv_type == "CREDIT_MEMO":
         refund_id = _text(_find_first(header, "Reference1"))
     else:
         refund_id = _invoice_refund_reference_value(header)
-    date_invoiced = _text(_find_first(header, "DateInvoiced"))
+    tx_date_iso = _to_iso8601_utc(_text(_find_first(header, "DateInvoiced")))
+    inv_no = _invoice_invoice_no(header)
+    # customer_id = _invoice_customer_id(header)  # may be ""
 
-    out = json.loads(REFUND_TEMPLATE_JSON)
-    hdr = out["InvoiceHeader"]
-
-    hdr["InvoiceNo"] = tx_num
-    hdr["Reference1"] = f"REFUND-{refund_id}" if refund_id else ""
-    hdr["Interco"] = "TO"
-    hdr["DateInvoiced"] = _to_yyyymmdd_int(date_invoiced)
-    hdr["InvoiceType"] = "CREDIT_MEMO"
-
-    ship = hdr.setdefault("Shipment", {})
-    ship["ActualShipmentDate"] = _to_yyyymmdd_int(date_invoiced)
-    ship["NodeType"] = "DC"
-    ship["_ShipNode"] = "SN001"
-    ship["ShipmentNo"] = "SHIP123"
-
-    price = hdr.setdefault("Order", {}).setdefault("PriceInfo", {})
-    price["Currency"] = currency
-    price["EnterpriseCurrency"] = currency
-    price["ReportingConversionRate"] = 1
-
-    bill_to = hdr["Order"].setdefault("PersonInfoBillTo", {})
-    bill_to["PersonInfoKey"] = ""
-
-    lined = hdr.setdefault("LineDetails", {})
-    lined["TotalLines"] = "1"
-    line0 = lined.setdefault("LineDetail", [{}])[0]
-    ol = line0.setdefault("OrderLine", {})
-    ol["LineType"] = "mrkl"
-    ol.setdefault("Extn", {})["ExtnMiraklOrderID"] = ""
-
-    refs = ol.setdefault("References", {}).setdefault("Reference", [{}])
-    if not refs:
-        refs.append({})
-    refs[0]["Name"] = "RO-ID"
-    refs[0]["Value"] = f"MRKL-REF-{refund_id}" if refund_id else ""
-
-    coll0 = hdr.setdefault("CollectionDetails", {}).setdefault("CollectionDetail", [{}])[0]
-    coll0["AmountCollected"] = amount_str
-
-    return out
+    return {
+        "amount": amount,
+        "currency_iso_code": currency,
+        "refund_id": refund_id,
+        "payment_status": "OK",
+        "transaction_date": tx_date_iso,
+        "transaction_number": inv_no,
+    }
 
 
-# ===================== Mirakl order feed (body) mapper =====================
+# ===================== Mirakl feed/wrapper mappers to SIMPLE payloads =====================
 
-def _sum_texts(els: List[ET.Element]) -> Decimal:
-    total = Decimal("0")
-    for e in els:
-        d = _to_decimal(_text(e))
-        if d is not None:
-            total += d
-    return total
-
-def _map_mirakl_order_body_to_template(root: ET.Element) -> Dict[str, Any]:
+def _map_mirakl_order_body_to_simple(root: ET.Element) -> Dict[str, Any]:
+    """
+    <body><orders><order>...</order></orders></body>
+    Compute amount = price + shipping_price + Σ(taxes) + Σ(shipping_taxes)
+    """
     order = _find_first(root, "body/orders/order") or _find_first(root, "orders/order") or root
-    # base amount = price + shipping_price
+
+    def _sum_nodes(nodes: List[ET.Element]) -> Decimal:
+        total = Decimal("0")
+        for n in nodes:
+            d = _to_decimal(_text(n))
+            if d is not None:
+                total += d
+        return total
+
     price = _to_decimal(_text(_find_first(order, "price"))) or Decimal("0")
     shipping = _to_decimal(_text(_find_first(order, "shipping_price"))) or Decimal("0")
-    taxes = _sum_texts(_find_all(order, "order_lines/order_line/taxes/tax/amount"))
-    ship_taxes = _sum_texts(_find_all(order, "order_lines/order_line/shipping_taxes/shipping_tax/amount"))
+    taxes = _sum_nodes(_find_all(order, "order_lines/order_line/taxes/tax/amount"))
+    ship_taxes = _sum_nodes(_find_all(order, "order_lines/order_line/shipping_taxes/shipping_tax/amount"))
     total_amount = (price + shipping + taxes + ship_taxes).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    amount_str = f"{total_amount:.2f}"
 
-    currency = _text(_find_first(order, "currency_iso_code"))
-    customer_id = _text(_find_first(order, "customer/customer_id"))
-    order_id = _text(_find_first(order, "order_id"))
-    tx_num = _text(_find_first(order, "transaction_number"))
-    tx_date_iso = _text(_find_first(order, "transaction_date"))
+    payload = {
+        "amount": f"{total_amount:.2f}",
+        "currency_iso_code": _text(_find_first(order, "currency_iso_code")),
+        "customer_id": _text(_find_first(order, "customer/customer_id")),
+        "order_id": _text(_find_first(order, "order_id")),
+        "payment_status": "OK",
+        "transaction_date": _to_iso8601_utc(_text(_find_first(order, "transaction_date"))),
+        "transaction_number": _text(_find_first(order, "transaction_number")),
+    }
+    return payload
 
-    out = json.loads(ORDER_TEMPLATE_JSON)
-    hdr = out["InvoiceHeader"]
-
-    hdr["InvoiceNo"] = tx_num
-    hdr["DateInvoiced"] = _to_epoch_ms(tx_date_iso)
-    hdr["InvoiceType"] = "shipment"
-
-    ship = hdr.setdefault("Shipment", {})
-    ship["ActualShipmentDate"] = _to_epoch_ms(tx_date_iso)
-    ship["NodeType"] = "DC"
-    ship["_ShipNode"] = "SN001"
-    ship["ShipmentNo"] = order_id
-
-    price_info = hdr.setdefault("Order", {}).setdefault("PriceInfo", {})
-    price_info["Currency"] = currency
-    price_info["EnterpriseCurrency"] = currency
-    price_info["ReportingConversionRate"] = 1.0
-
-    bill_to = hdr["Order"].setdefault("PersonInfoBillTo", {})
-    bill_to["PersonInfoKey"] = customer_id
-
-    lined = hdr.setdefault("LineDetails", {})
-    lined["TotalLines"] = "1"
-    line0 = lined.setdefault("LineDetail", [{}])[0]
-    ol = line0.setdefault("OrderLine", {})
-    ol["LineType"] = "mrkl"
-    ol.setdefault("Extn", {})["ExtnMiraklOrderID"] = order_id
-
-    coll0 = hdr.setdefault("CollectionDetails", {}).setdefault("CollectionDetail", [{}])[0]
-    coll0["AmountCollected"] = amount_str
-
-    return out
-
-
-# ===================== MiraklOrderRefund wrapper mapper =====================
-
-def _map_mirakl_wrapper_to_template(root: ET.Element, mode: str) -> Optional[Dict[str, Any]]:
+def _map_mirakl_wrapper_to_simple(root: ET.Element, mode: str) -> Optional[Dict[str, Any]]:
+    """
+    <MiraklOrderRefund><Order>...</Order></MiraklOrderRefund>  -> orders payload
+    <MiraklOrderRefund><Refund>...</Refund></MiraklOrderRefund> -> refunds payload
+    """
     order = _find_first(root, "MiraklOrderRefund/Order") or _find_first(root, "Order")
     refund = _find_first(root, "MiraklOrderRefund/Refund") or _find_first(root, "Refund")
 
     if mode == "order" and order is not None:
-        amount_str = _sum_amounts_str([_text(_find_first(order, "amount"))], abs_value=False)
-        currency = _text(_find_first(order, "currency_iso_code"))
-        customer_id = _text(_find_first(order, "customer_id"))
-        order_id = _text(_find_first(order, "order_id"))
-        tx_num = _text(_find_first(order, "transaction_number"))
-        tx_date_iso = _text(_find_first(order, "transaction_date"))
-
-        out = json.loads(ORDER_TEMPLATE_JSON)
-        hdr = out["InvoiceHeader"]
-        hdr["InvoiceNo"] = tx_num
-        hdr["DateInvoiced"] = _to_epoch_ms(tx_date_iso)
-        hdr["InvoiceType"] = "shipment"
-
-        ship = hdr.setdefault("Shipment", {})
-        ship["ActualShipmentDate"] = _to_epoch_ms(tx_date_iso)
-        ship["NodeType"] = "DC"
-        ship["_ShipNode"] = "SN001"
-        ship["ShipmentNo"] = order_id
-
-        price_info = hdr.setdefault("Order", {}).setdefault("PriceInfo", {})
-        price_info["Currency"] = currency
-        price_info["EnterpriseCurrency"] = currency
-        price_info["ReportingConversionRate"] = 1.0
-
-        bill_to = hdr["Order"].setdefault("PersonInfoBillTo", {})
-        bill_to["PersonInfoKey"] = customer_id
-
-        lined = hdr.setdefault("LineDetails", {})
-        lined["TotalLines"] = "1"
-        line0 = lined.setdefault("LineDetail", [{}])[0]
-        ol = line0.setdefault("OrderLine", {})
-        ol["LineType"] = "mrkl"
-        ol.setdefault("Extn", {})["ExtnMiraklOrderID"] = order_id
-
-        coll0 = hdr.setdefault("CollectionDetails", {}).setdefault("CollectionDetail", [{}])[0]
-        coll0["AmountCollected"] = amount_str
-        return out
+        return {
+            "amount": _sum_amounts_str([_text(_find_first(order, "amount"))], abs_value=False),
+            "currency_iso_code": _text(_find_first(order, "currency_iso_code")),
+            "customer_id": _text(_find_first(order, "customer_id")),
+            "order_id": _text(_find_first(order, "order_id")),
+            "payment_status": "OK",  # fixed
+            "transaction_date": _to_iso8601_utc(_text(_find_first(order, "transaction_date"))),
+            "transaction_number": _text(_find_first(order, "transaction_number")),
+        }
 
     if mode == "refund" and refund is not None:
-        amount_str = _sum_amounts_str([_text(_find_first(refund, "amount"))], abs_value=True)
-        currency = _text(_find_first(refund, "currency_iso_code"))
-        refund_id = _text(_find_first(refund, "refund_id"))
-        tx_num = _text(_find_first(refund, "transaction_number"))
-        tx_date_iso = _text(_find_first(refund, "transaction_date"))
-
-        out = json.loads(REFUND_TEMPLATE_JSON)
-        hdr = out["InvoiceHeader"]
-        hdr["InvoiceNo"] = tx_num
-        hdr["Reference1"] = f"REFUND-{refund_id}" if refund_id else ""
-        hdr["Interco"] = "TO"
-        hdr["DateInvoiced"] = _to_yyyymmdd_int(tx_date_iso)
-        hdr["InvoiceType"] = "CREDIT_MEMO"
-
-        ship = hdr.setdefault("Shipment", {})
-        ship["ActualShipmentDate"] = _to_yyyymmdd_int(tx_date_iso)
-        ship["NodeType"] = "DC"
-        ship["_ShipNode"] = "SN001"
-        ship["ShipmentNo"] = "SHIP123"
-
-        price_info = hdr.setdefault("Order", {}).setdefault("PriceInfo", {})
-        price_info["Currency"] = currency
-        price_info["EnterpriseCurrency"] = currency
-        price_info["ReportingConversionRate"] = 1
-
-        bill_to = hdr["Order"].setdefault("PersonInfoBillTo", {})
-        bill_to["PersonInfoKey"] = ""
-
-        lined = hdr.setdefault("LineDetails", {})
-        lined["TotalLines"] = "1"
-        line0 = lined.setdefault("LineDetail", [{}])[0]
-        ol = line0.setdefault("OrderLine", {})
-        ol["LineType"] = "mrkl"
-        ol.setdefault("Extn", {})["ExtnMiraklOrderID"] = ""
-
-        refs = ol.setdefault("References", {}).setdefault("Reference", [{}])
-        if not refs:
-            refs.append({})
-        refs[0]["Name"] = "RO-ID"
-        refs[0]["Value"] = f"MRKL-REF-{refund_id}" if refund_id else ""
-
-        coll0 = hdr.setdefault("CollectionDetails", {}).setdefault("CollectionDetail", [{}])[0]
-        coll0["AmountCollected"] = amount_str
-        return out
+        # Wrapper Refund typically has no customer_id; emit empty string
+        return {
+            "amount": _sum_amounts_str([_text(_find_first(refund, "amount"))], abs_value=True),
+            "currency_iso_code": _text(_find_first(refund, "currency_iso_code")),
+            # "customer_id": "",  # not available in wrapper; keep field for shape consistency
+            "refund_id": _text(_find_first(refund, "refund_id")),
+            "payment_status": "OK",
+            "transaction_date": _to_iso8601_utc(_text(_find_first(refund, "transaction_date"))),
+            "transaction_number": _text(_find_first(refund, "transaction_number")),
+        }
 
     return None
 
@@ -553,31 +311,41 @@ def _map_mirakl_wrapper_to_template(root: ET.Element, mode: str) -> Optional[Dic
 
 def map_mirakl_xml_to_template(xml_text: str, mode: str) -> Dict[str, Any]:
     """
-    Convert XML into the nested JSON templates using all supported shapes.
+    Convert XML into SIMPLE Mirakl JSON payloads.
+    mode='order'  -> {"orders":[payload]}
+    mode='refund' -> {"refunds":[payload]}
     """
     root = ET.fromstring(xml_text)
 
-    # 1) MiraklOrderRefund wrapper (preferred when present)
-    wrapped = _map_mirakl_wrapper_to_template(root, mode)
+    # Prefer wrapper if present
+    wrapped = _map_mirakl_wrapper_to_simple(root, mode)
     if wrapped is not None:
-        return wrapped
+        return {"orders": [wrapped]} if mode == "order" else {"refunds": [wrapped]}
 
-    # 2) Mirakl order feed body
+    # Mirakl body (orders only)
     if mode == "order" and (_find_first(root, "body/orders/order") or _find_first(root, "orders/order")):
-        return _map_mirakl_order_body_to_template(root)
+        payload = _map_mirakl_order_body_to_simple(root)
+        return {"orders": [payload]}
 
-    # 3) Sterling invoice fallback
-    if mode == "order":
-        return _map_invoice_to_order_template(root)
-    else:
-        return _map_invoice_to_refund_template(root)
+    # Sterling fallback using Excel mappings
+    header = _invoice_header(root)
+    if header is not None:
+        if mode == "order":
+            payload = _build_order_payload_from_invoice(header)
+            return {"orders": [payload]}
+        else:
+            payload = _build_refund_payload_from_invoice(header)
+            return {"refunds": [payload]}
+
+    # If nothing matched, return empty skeleton (never crash)
+    return {"orders": []} if mode == "order" else {"refunds": []}
 
 
 def transform_payload(folder_key: str, xml_text: str) -> Optional[Dict[str, Any]]:
     """
-    Convenience router for your extractor:
-      - folder_key "mirakl-order"  -> map as order template
-      - folder_key "mirakl-refund" -> map as refund template
+    Router for the extractor:
+      - folder_key "mirakl-order"  -> map as orders payload
+      - folder_key "mirakl-refund" -> map as refunds payload
       - otherwise -> None
     """
     fk = (folder_key or "").strip().lower()
@@ -588,11 +356,11 @@ def transform_payload(folder_key: str, xml_text: str) -> Optional[Dict[str, Any]
     return None
 
 
-# ===================== CLI (optional for quick testing) =====================
+# ===================== CLI (optional quick test) =====================
 
 if __name__ == "__main__":
     import sys, argparse
-    ap = argparse.ArgumentParser(description="Map Mirakl XML into nested JSON templates.")
+    ap = argparse.ArgumentParser(description="Map Mirakl XML into simple Mirakl JSON payloads.")
     ap.add_argument("--mode", choices=["order","refund"], required=True)
     ap.add_argument("xmlfile")
     args = ap.parse_args()

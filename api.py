@@ -49,7 +49,8 @@ def si_log_extract(anything: str):
     try:
         import main as main_mod
         with redirect_stdout(out_buf), redirect_stderr(err_buf):
-            main_mod.main()
+            print(ts)
+            main_mod.main(ts)
     except SystemExit as se:
         # propagate non-zero exits as HTTP 500
         code = se.code if isinstance(se.code, int) else 1
@@ -70,10 +71,11 @@ def si_log_extract(anything: str):
     # Keep the original response shape exactly the same
     resp = {
         "input": input_prefix,
-        "mirkl_output": f"{output_root}/mirkl",
-        "vertex_output": f"{output_root}/vertex",
-        "ip-us": f"{output_root}/ip-us",
-        "ip-uk": f"{output_root}/ip-uk",
-        "pix": f"{output_root}/pix",
+        "date": ts,
+        # "mirkl_output": f"{output_root}/mirkl",
+        # "vertex_output": f"{output_root}/vertex",
+        # "ip-us": f"{output_root}/ip-us",
+        # "ip-uk": f"{output_root}/ip-uk",
+        # "pix": f"{output_root}/pix",
     }
     return JSONResponse(content=resp)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import json, re, html, glob, sys, shutil, os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 # NEW: import the transformer
 from transformer import map_mirakl_xml_to_template
@@ -88,7 +88,7 @@ NAMING_RULES: Dict[str, Tuple[str, str]] = {
 
 # --------------------- core ---------------------
 
-def process(config_path: Path) -> Dict[str, object]:
+def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, object]:
     raw = config_path.read_text(encoding="utf-8")
     cfg = json.loads(raw)
     cfg = expand_env_deep(cfg)
@@ -105,6 +105,9 @@ def process(config_path: Path) -> Dict[str, object]:
     if cfg.get("fresh", False) and out_root.exists():
         shutil.rmtree(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
+
+    # Normalize the date folder once
+    date_prefix = safe_folder(input_date) if input_date else None
 
     raw_filters = cfg.get("filters", [])
     filters = []
@@ -154,7 +157,11 @@ def process(config_path: Path) -> Dict[str, object]:
 
                 for flt in filters:
                     if record_matches(src, flt["want_desc_l"], flt["want_name_l"]):
-                        folder_path = out_root / flt["folder"]
+                        # >>>>>>>>>>>>> DATE PREFIX HERE <<<<<<<<<<<<<
+                        if date_prefix:
+                            folder_path = out_root / date_prefix / flt["folder"]
+                        else:
+                            folder_path = out_root / flt["folder"]
                         folder_path.mkdir(parents=True, exist_ok=True)
 
                         invoice = extract_invoice(src).strip()
@@ -166,23 +173,18 @@ def process(config_path: Path) -> Dict[str, object]:
                             out_path = make_unique(out_path)
 
                             if flt["folder_key"] in ("mirakl-order", "mirakl-refund"):
-                                # NEW: transform Mirakl XML -> Mirakl JSON using your Excel rules
                                 try:
                                     mode = "order" if flt["folder_key"] == "mirakl-order" else "refund"
                                     mapped = map_mirakl_xml_to_template(str(pl), mode=mode)
                                     out_path.write_text(json.dumps(mapped, indent=2, ensure_ascii=False), encoding="utf-8")
                                 except Exception as e:
-                                    # Fallback to raw write if something goes wrong
                                     with out_path.open("w", encoding="utf-8") as f:
                                         f.write(f"# [WARN] mapping failed: {e}\n")
-                                        # f.write(f"# ----- source={p.name} invoice={invoice} -----\n")
                                         f.write(str(pl))
                                         if not str(pl).endswith("\n"):
                                             f.write("\n")
                             else:
-                                # original behavior
                                 with out_path.open("w", encoding="utf-8") as f:
-                                    # f.write(f"# ----- source={p.name} invoice={invoice} -----\n")
                                     f.write(str(pl))
                                     if not str(pl).endswith("\n"):
                                         f.write("\n")
@@ -207,7 +209,11 @@ def process(config_path: Path) -> Dict[str, object]:
 
     return stats
 
-def main():
+def main(input_date: Optional[str] = None):
+    # show the date we’re using (helps when called from API)
+    if input_date:
+        print(f"[INFO] Using date prefix: {input_date}")
+
     cfg_path_str = expand_env_str(CONFIG_TEMPLATE)
     if "${ROOT_PATH}" in CONFIG_TEMPLATE or "$ROOT_PATH" in CONFIG_TEMPLATE:
         root = os.environ.get("ROOT_PATH", ".")
@@ -218,9 +224,11 @@ def main():
         print(f"[ERROR] Config not found at: {cfg_path}", file=sys.stderr)
         sys.exit(1)
 
-    stats = process(cfg_path)
+    stats = process(cfg_path, input_date=input_date)
     print(f"\nScanned: {stats['files_scanned']} JSON files")
     print(f"Total records written: {stats['hits']}")
 
 if __name__ == "__main__":
-    main()
+    # Optional CLI support: python main.py 2025-08-25
+    arg_date = sys.argv[1] if len(sys.argv) > 1 else None
+    main(arg_date)
