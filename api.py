@@ -10,49 +10,57 @@ import re
 
 app = FastAPI()
 
-# Find any YYYY-mm-dd substring within the path piece
 DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
 def extract_date_from_any(s: str) -> str:
-    """
-    Return the LAST valid YYYY-mm-dd found in s.
-    Raises HTTP 400 if none found or none are valid dates.
-    """
     matches = DATE_RE.findall(s or "")
     if not matches:
         raise HTTPException(status_code=400, detail="No YYYY-mm-dd date found in the URI segment")
-
-    # Try from the end (last date wins)
     for token in reversed(matches):
         try:
-            # Validate calendar date
             datetime.strptime(token, "%Y-%m-%d")
             return token
         except ValueError:
             continue
-
     raise HTTPException(status_code=400, detail="Found date-like text, but not a valid YYYY-mm-dd")
 
 @app.get("/si-log-extract/{anything}")
 def si_log_extract(anything: str):
-    # Extract and validate date from arbitrary string
+    # 1) get the date and build the timestamp suffix (yyyy-mm-dd-HHMMSS in IST)
     date_str = extract_date_from_any(anything)
-
-    # IST timestamp suffix: yyyy-mm-dd-HHMMSS
     ts = f"{date_str}-{datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%H%M%S')}"
 
-    input_prefix = f"salesinvoice/producer-input/{ts}"
-    output_root  = f"salesinvoice/expected-output/{ts}"
-
-    # ---- just run main.main() ----
+    # 2) run main.main(ts) and capture output for debugging
     out_buf, err_buf = StringIO(), StringIO()
     try:
+        import os
+        from pathlib import Path
         import main as main_mod
+
         with redirect_stdout(out_buf), redirect_stderr(err_buf):
-            print(ts)
-            main_mod.main(ts)
+            paths = main_mod.main(ts)  # may be None if main() doesn't return
+
+        # ---- Fallback: if main() didn't return paths, call process() directly ----
+        if not isinstance(paths, dict) or not paths:
+            cfg_path_str = main_mod.expand_env_str(main_mod.CONFIG_TEMPLATE)
+            if "${ROOT_PATH}" in main_mod.CONFIG_TEMPLATE or "$ROOT_PATH" in main_mod.CONFIG_TEMPLATE:
+                root = os.environ.get("ROOT_PATH", ".")
+                cfg_path_str = str(Path(root) / "config.json")
+
+            cfg_path = Path(cfg_path_str).resolve()
+            if not cfg_path.exists():
+                raise HTTPException(status_code=500, detail={
+                    "error": f"Config not found at: {cfg_path}",
+                    "stdout": out_buf.getvalue(),
+                    "stderr": err_buf.getvalue(),
+                })
+
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                stats = main_mod.process(cfg_path, input_date=ts)
+
+            paths = (stats or {}).get("paths", {})
+
     except SystemExit as se:
-        # propagate non-zero exits as HTTP 500
         code = se.code if isinstance(se.code, int) else 1
         if code != 0:
             raise HTTPException(status_code=500, detail={
@@ -61,6 +69,7 @@ def si_log_extract(anything: str):
                 "stdout": out_buf.getvalue(),
                 "stderr": err_buf.getvalue(),
             })
+        paths = None
     except Exception as e:
         raise HTTPException(status_code=500, detail={
             "error": f"Failed running main.py: {e}",
@@ -68,14 +77,10 @@ def si_log_extract(anything: str):
             "stderr": err_buf.getvalue(),
         })
 
-    # Keep the original response shape exactly the same
-    resp = {
-        "input": input_prefix,
-        "date": ts,
-        # "mirkl_output": f"{output_root}/mirkl",
-        # "vertex_output": f"{output_root}/vertex",
-        # "ip-us": f"{output_root}/ip-us",
-        # "ip-uk": f"{output_root}/ip-uk",
-        # "pix": f"{output_root}/pix",
-    }
-    return JSONResponse(content=resp)
+    # 3) return whatever we have (ensure 'date' is present)
+    if isinstance(paths, dict) and paths:
+        paths.setdefault("date", ts)
+        return JSONResponse(content=paths)
+
+    # Fallback if nothing usable
+    return JSONResponse(content={"date": ts})

@@ -3,8 +3,14 @@ import json, re, html, glob, sys, shutil, os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 
-# NEW: import the transformer
+# Transformer (unchanged)
 from transformer import map_mirakl_xml_to_template
+
+# Try to import the GCS bridge. If missing, we’ll run locally.
+try:
+    from gcs_utils import run_with_optional_gcs  # <-- your new helper file
+except Exception:
+    run_with_optional_gcs = None
 
 # ===================== env-config path (as requested) ===================== #
 CONFIG_TEMPLATE = "${ROOT_PATH}/config.json"
@@ -77,7 +83,7 @@ def norm_folder_key(folder: str) -> str:
 # --------------------- naming rules ---------------------
 
 NAMING_RULES: Dict[str, Tuple[str, str]] = {
-    "input":         ("input",        "xml"),
+    "producer-input":         ("input",        "xml"),
     "mirakl-order":  ("mirakl_order", "json"),
     "mirakl-refund": ("mirakl_refund","json"),
     "vertex":        ("vertex",       "txt"),
@@ -157,21 +163,29 @@ def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, ob
 
                 for flt in filters:
                     if record_matches(src, flt["want_desc_l"], flt["want_name_l"]):
-                        # >>>>>>>>>>>>> DATE PREFIX HERE <<<<<<<<<<<<<
-                        if date_prefix:
-                            folder_path = out_root / date_prefix / flt["folder"]
+                        # -------- NEW: build folder_path (producer-input unchanged; others under expected-output) --------
+                        base = (out_root / date_prefix) if date_prefix else out_root
+                
+                        if flt["folder_key"] == "producer-input":
+                            # keep original behavior
+                            folder_path = base / flt["folder"]
                         else:
-                            folder_path = out_root / flt["folder"]
+                            # add the 'expected-output' subfolder for everything else
+                            # (optional: collapse mirakl-order/refund into a single 'mirakl' folder)
+                            leaf = "mirakl" if flt["folder_key"] in ("mirakl-order", "mirakl-refund") else flt["folder"]
+                            folder_path = base / "expected-output" / leaf
+                
                         folder_path.mkdir(parents=True, exist_ok=True)
-
+                        # -----------------------------------------------------------------------------------------------
+                
                         invoice = extract_invoice(src).strip()
                         invoice_sanitized = re.sub(r"[^A-Za-z0-9_-]+", "", invoice) or "unknown"
-
+                
                         for pl in payloads:
                             filename = f"{flt['prefix']}_{invoice_sanitized}.{flt['ext']}"
                             out_path = folder_path / safe_filename(filename)
                             out_path = make_unique(out_path)
-
+                
                             if flt["folder_key"] in ("mirakl-order", "mirakl-refund"):
                                 try:
                                     mode = "order" if flt["folder_key"] == "mirakl-order" else "refund"
@@ -207,6 +221,19 @@ def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, ob
             en = f" & EventName='{flt['want_name']}'" if flt["want_name"] else ""
             print(f"  - folder='{flt['folder']}', EventDescription='{flt['want_desc']}'{en}")
 
+    
+    
+    base = (out_root / date_prefix) if date_prefix else out_root
+    stats["paths"] = {
+        "date": date_prefix or "",
+        "root": str(base),
+        "input": str(base / "producer-input"),
+        "mirakl_output": str(base / "expected-output" / "mirakl"),
+        "vertex_output": str(base / "expected-output" / "vertex"),
+        "ip-us": str(base / "expected-output" / "ip-us"),
+        "ip-uk": str(base / "expected-output" / "ip-uk"),
+        "pix": str(base / "expected-output" / "pix"),
+    }
     return stats
 
 def main(input_date: Optional[str] = None):
@@ -219,14 +246,35 @@ def main(input_date: Optional[str] = None):
         root = os.environ.get("ROOT_PATH", ".")
         cfg_path_str = str(Path(root) / "config.json")
 
-    cfg_path = Path(cfg_path_str).resolve()
-    if not cfg_path.exists():
-        print(f"[ERROR] Config not found at: {cfg_path}", file=sys.stderr)
-        sys.exit(1)
+    # If the GCS bridge is available, let it decide (gs:// vs local) and
+    # run our existing process() on a local mirror when needed.
+    if run_with_optional_gcs:
+        try:
+            stats = run_with_optional_gcs(
+                config_path_str=cfg_path_str,
+                process_fn=lambda local_cfg_path: process(local_cfg_path, input_date=input_date),
+            )
+        except Exception as e:
+            print(f"[WARN] GCS run failed ({e}); falling back to local.")
+            cfg_path = Path(cfg_path_str).resolve()
+            if not cfg_path.exists():
+                print(f"[ERROR] Config not found at: {cfg_path}", file=sys.stderr)
+                sys.exit(1)
+            stats = process(cfg_path, input_date=input_date)
+    else:
+        # Local-only fallback
+        print("[INFO] gcs_utils not found; running locally.")
+        cfg_path = Path(cfg_path_str).resolve()
+        if not cfg_path.exists():
+            print(f"[ERROR] Config not found at: {cfg_path}", file=sys.stderr)
+            sys.exit(1)
+        stats = process(cfg_path, input_date=input_date)
 
-    stats = process(cfg_path, input_date=input_date)
-    print(f"\nScanned: {stats['files_scanned']} JSON files")
-    print(f"Total records written: {stats['hits']}")
+    print(f"\nScanned: {stats.get('files_scanned', 0)} JSON files")
+    print(f"Total records written: {stats.get('hits', 0)}")
+    if "gcs_downloaded" in stats or "gcs_uploaded" in stats:
+        print(f"GCS downloaded: {stats.get('gcs_downloaded', 0)}, uploaded: {stats.get('gcs_uploaded', 0)}")
+        print(f"Temp mirror: {stats.get('gcs_tmp_root', '-')}")
 
 if __name__ == "__main__":
     # Optional CLI support: python main.py 2025-08-25
