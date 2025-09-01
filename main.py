@@ -108,9 +108,16 @@ def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, ob
     out_root_cfg = cfg["output"]
     out_root = Path(out_root_cfg) if Path(out_root_cfg).is_absolute() else (base_dir / out_root_cfg)
 
-    if cfg.get("fresh", False) and out_root.exists():
-        shutil.rmtree(out_root)
-    out_root.mkdir(parents=True, exist_ok=True)
+    # keep: out_root.mkdir(parents=True, exist_ok=True)
+    
+    # Normalize the date folder once
+    date_prefix = safe_folder(input_date) if input_date else None
+    
+    # Target root for THIS run (e.g., <output>/<date>)
+    target_root = (out_root / date_prefix) if date_prefix else out_root
+    
+    if cfg.get("fresh", False) and target_root.exists():
+        shutil.rmtree(target_root)
 
     # Normalize the date folder once
     date_prefix = safe_folder(input_date) if input_date else None
@@ -223,16 +230,17 @@ def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, ob
 
     
     
-    base = (out_root / date_prefix) if date_prefix else out_root
+    base = out_root.resolve().parent
+    folder_name = out_root.resolve().name
     stats["paths"] = {
         "date": date_prefix or "",
         "root": str(base),
-        "input": str(base / "producer-input"),
-        "mirakl_output": str(base / "expected-output" / "mirakl"),
-        "vertex_output": str(base / "expected-output" / "vertex"),
-        "ip-us": str(base / "expected-output" / "ip-us"),
-        "ip-uk": str(base / "expected-output" / "ip-uk"),
-        "pix": str(base / "expected-output" / "pix"),
+        "input": "{ROOT_PATH}" + "/" + folder_name +"/"+ date_prefix + "/" + "producer-input",
+        "mirakl_output": "{ROOT_PATH}" + "/" + folder_name + "/"+ date_prefix + "/" + "expected-output/mirakl",
+        "vertex_output": "{ROOT_PATH}"  + "/" + folder_name +"/"+ date_prefix + "/" +"expected-output/vertex",
+        "ip-us": "{ROOT_PATH}"  + "/" + folder_name +"/"+ date_prefix + "/" +"expected-output/ip-us",
+        "ip-uk": "{ROOT_PATH}"  + "/" + folder_name +"/"+ date_prefix + "/" +"expected-output/ip-uk",
+        "pix": "{ROOT_PATH}"  + "/" + folder_name +"/"+ date_prefix + "/" +"expected-output/pix",
     }
     return stats
 
