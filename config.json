@@ -1,0 +1,43 @@
+{
+  "input_glob": "${ROOT_PATH}/files/All/all_*.json",
+  "output": "${ROOT_PATH}",
+  "fresh": true,
+  "filters": [
+     {
+      "folder": "producer-input",
+      "event_description": "SalesAudit OMS Service picked up the message and started processing",
+      "event_name": "Received message from Sterling"
+    },
+    {
+      "folder": "mirakl-order",
+      "event_description": "Mirakl PA01 API request",
+      "event_name": ""
+    },
+    {
+      "folder": "mirakl-refund",
+      "event_description": "Mirakl PA02 API request",
+      "event_name": ""
+    },
+    {
+      "folder": "vertex",
+      "event_description": "SalesAuditWriteFile OMS: Vertex record successfully written to file",
+      "event_name": ""
+    },
+    {
+      "folder": "ip-us",
+      "event_description": "Sales record successfully written to file",
+      "event_name": "SalesAudit-US record"
+    },
+    {
+      "folder": "ip-uk",
+      "event_description": "Sales record successfully written to file",
+      "event_name": "SalesAudit-UK record"
+    },
+    {
+      "folder": "pix",
+      "event_description": "SalesAudit Pix Record sent successfully to WMSPix Queue",
+      "event_name": ""
+    }
+  ]
+}
+ 
