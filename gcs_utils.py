@@ -186,7 +186,7 @@ def run_with_optional_gcs(
     """
     # Simple local path case fast-path
     might_be_remote_cfg = is_gs_uri(config_path_str)
-
+    print(f"[GCS] fil😂e Config path: {config_path_str} (remote={might_be_remote_cfg})")
     # If config.json is local, we still may have gs:// in its values
     if not might_be_remote_cfg and not Path(config_path_str).exists():
         raise FileNotFoundError(f"Config not found at: {config_path_str}")
