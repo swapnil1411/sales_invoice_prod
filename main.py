@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-import json, re, html, glob, sys, shutil, os
+# -*- coding: utf-8 -*-
+
+"""
+Single-file GCS-only runner:
+- Requires ROOT_PATH to be a gs:// URI (e.g., gs://bucket/prefix)
+- Mirrors that prefix to a local temp dir
+- Runs your existing process() logic locally (unchanged)
+- Syncs the outputs back to the same GCS prefix
+"""
+
+import json, re, html, glob, sys, shutil, os, tempfile, subprocess, uuid
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 
-# ---- Make sibling imports robust ----
-from pathlib import Path as _Path
-import sys as _sys
-_SYS_THIS_DIR = str(_Path(__file__).resolve().parent)
-if _SYS_THIS_DIR not in _sys.path:
-    _sys.path.insert(0, _SYS_THIS_DIR)
-
+# ===================== Your imports (unchanged) ===================== #
 from transformer import map_mirakl_xml_to_template
-from gcs_utils import run_with_optional_gcs  # GCS bridge only
+# =================================================================== #
 
-# ===================== env-config path (as requested) ===================== #
+# ===================== env-config path (UNCHANGED) ================== #
 CONFIG_TEMPLATE = "${ROOT_PATH}/config.json"
-# ========================================================================== #
+# =================================================================== #
 
-# --------------------- helpers ---------------------
-
+# --------------------- helpers (UNCHANGED) --------------------- #
 def expand_env_str(s: str) -> str:
     return os.path.expanduser(os.path.expandvars(s))
 
@@ -81,20 +84,18 @@ def make_unique(path: Path) -> Path:
 def norm_folder_key(folder: str) -> str:
     return (folder or "").strip().lower().replace(" ", "_")
 
-# --------------------- naming rules ---------------------
-
+# --------------------- naming rules (UNCHANGED) --------------------- #
 NAMING_RULES: Dict[str, Tuple[str, str]] = {
-    "producer-input": ("input", "xml"),
+    "producer-input": ("input",        "xml"),
     "mirakl-order":   ("mirakl_order", "json"),
     "mirakl-refund":  ("mirakl_refund","json"),
-    "vertex":         ("vertex", "txt"),
-    "ip-us":          ("ip-us", "txt"),
-    "ip-uk":          ("ip-uk", "txt"),
-    "pix":            ("pix", "xml"),
+    "vertex":         ("vertex",       "txt"),
+    "ip-us":          ("ip-us",        "txt"),
+    "ip-uk":          ("ip-uk",        "txt"),
+    "pix":            ("pix",          "xml"),
 }
 
-# --------------------- core ---------------------
-
+# --------------------- core (UNCHANGED) --------------------- #
 def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, object]:
     raw = config_path.read_text(encoding="utf-8")
     cfg = json.loads(raw)
@@ -109,14 +110,19 @@ def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, ob
     out_root_cfg = cfg["output"]
     out_root = Path(out_root_cfg) if Path(out_root_cfg).is_absolute() else (base_dir / out_root_cfg)
 
+    # keep: out_root.mkdir(parents=True, exist_ok=True)
+
     # Normalize the date folder once
-    date_prefix = safe_folder(input_date) if input_date else ""
+    date_prefix = safe_folder(input_date) if input_date else None
 
     # Target root for THIS run (e.g., <output>/<date>)
     target_root = (out_root / date_prefix) if date_prefix else out_root
 
     if cfg.get("fresh", False) and target_root.exists():
         shutil.rmtree(target_root)
+
+    # Normalize the date folder once
+    date_prefix = safe_folder(input_date) if input_date else None
 
     raw_filters = cfg.get("filters", [])
     filters = []
@@ -166,7 +172,7 @@ def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, ob
 
                 for flt in filters:
                     if record_matches(src, flt["want_desc_l"], flt["want_name_l"]):
-                        # Build folder_path (producer-input unchanged; others under expected-output)
+                        # -------- folder layout (UNCHANGED behavior intent) --------
                         base = (out_root / date_prefix) if date_prefix else out_root
 
                         if flt["folder_key"] == "producer-input":
@@ -176,6 +182,7 @@ def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, ob
                             folder_path = base / "expected-output" / leaf
 
                         folder_path.mkdir(parents=True, exist_ok=True)
+                        # -----------------------------------------------------------
 
                         invoice = extract_invoice(src).strip()
                         invoice_sanitized = re.sub(r"[^A-Za-z0-9_-]+", "", invoice) or "unknown"
@@ -205,8 +212,7 @@ def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, ob
                             stats["hits"] += 1
                             per_folder_hits[flt["folder"]] += 1
                             try:
-                                base_for_rel = (out_root / date_prefix) if date_prefix else out_root
-                                stats["written_files"].append(str(out_path.relative_to(base_for_rel)))
+                                stats["written_files"].append(str(out_path.relative_to(out_root)))
                             except Exception:
                                 stats["written_files"].append(str(out_path))
 
@@ -221,64 +227,161 @@ def process(config_path: Path, input_date: Optional[str] = None) -> Dict[str, ob
             en = f" & EventName='{flt['want_name']}'" if flt["want_name"] else ""
             print(f"  - folder='{flt['folder']}', EventDescription='{flt['want_desc']}'{en}")
 
-    # ---- Build clean, gs-aware display paths ----
-    remote_out = (cfg.get("_remote_output") or "").strip()
-    date_str = date_prefix
-    def _join(*parts: str) -> str:
-        return "/".join(p.strip("/") for p in parts if p)
-
-    if remote_out.startswith("gs://"):
-        # Use only the last segment (e.g., "my-test-2025-09-05") for display with {ROOT_PATH}
-        remote_key = remote_out.split("://", 1)[1].split("/", 1)[1] if "/" in remote_out.split("://", 1)[1] else ""
-        folder_name = remote_key.rstrip("/").split("/")[-1] if remote_key else ""
-        root_display = "{ROOT_PATH}"
-    else:
-        folder_name = out_root.resolve().name
-        root_display = str(out_root.resolve().parent)
-
+    base = out_root.resolve().parent
+    folder_name = out_root.resolve().name
+    date_prefix = safe_folder(date_prefix) if date_prefix else ""
     stats["paths"] = {
-        "date": date_str,
-        "root": root_display,
-        "input":          _join("{ROOT_PATH}", folder_name, date_str, "producer-input"),
-        "mirakl_output":  _join("{ROOT_PATH}", folder_name, date_str, "expected-output", "mirakl"),
-        "vertex_output":  _join("{ROOT_PATH}", folder_name, date_str, "expected-output", "vertex"),
-        "ip-us":          _join("{ROOT_PATH}", folder_name, date_str, "expected-output", "ip-us"),
-        "ip-uk":          _join("{ROOT_PATH}", folder_name, date_str, "expected-output", "ip-uk"),
-        "pix":            _join("{ROOT_PATH}", folder_name, date_str, "expected-output", "pix"),
+        "date": date_prefix or "",
+        "root": str(base),
+        "input": "{ROOT_PATH}" + "/" + folder_name + (("/" + date_prefix) if date_prefix else "") + "/" + "producer-input",
+        "mirakl_output": "{ROOT_PATH}" + "/" + folder_name + (("/" + date_prefix) if date_prefix else "") + "/" + "expected-output/mirakl",
+        "vertex_output": "{ROOT_PATH}" + "/" + folder_name + (("/" + date_prefix) if date_prefix else "") + "/" + "expected-output/vertex",
+        "ip-us": "{ROOT_PATH}" + "/" + folder_name + (("/" + date_prefix) if date_prefix else "") + "/" + "expected-output/ip-us",
+        "ip-uk": "{ROOT_PATH}" + "/" + folder_name + (("/" + date_prefix) if date_prefix else "") + "/" + "expected-output/ip-uk",
+        "pix": "{ROOT_PATH}" + "/" + folder_name + (("/" + date_prefix) if date_prefix else "") + "/" + "expected-output/pix",
     }
     return stats
 
-def main(input_date: Optional[str] = None):
-    # Require gs:// ROOT_PATH
-    root = (os.environ.get("ROOT_PATH", "") or "").strip()
-    print("[INFO] ROOT_PATH:", root)
-    if not root.startswith("gs://"):
-        print("[ERROR] ROOT_PATH must start with 'gs://'", file=sys.stderr)
-        sys.exit(1)
+# =======================================================================
+#                      G C S   H E L P E R S  (INLINE)
+# =======================================================================
+_GSUTIL_AVAILABLE: Optional[bool] = None
 
+def _which(exe: str) -> Optional[str]:
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        cand = Path(p) / exe
+        if cand.exists() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+def _gsutil_ok() -> bool:
+    global _GSUTIL_AVAILABLE
+    if _GSUTIL_AVAILABLE is not None:
+        return _GSUTIL_AVAILABLE
+    _GSUTIL_AVAILABLE = _which("gsutil") is not None
+    return _GSUTIL_AVAILABLE
+
+def _parse_gs_uri(uri: str) -> Tuple[str, str]:
+    m = re.match(r"^gs://([^/]+)/?(.*)$", uri.strip())
+    if not m:
+        raise ValueError(f"ROOT_PATH must be a gs:// URI, got: {uri}")
+    bucket, prefix = m.group(1), m.group(2)
+    prefix = prefix.strip("/")
+    return bucket, prefix
+
+def _rsync_down(gs_uri: str, local_dir: Path) -> int:
+    """
+    Download *entire* prefix to local_dir using gsutil -m rsync -r.
+    Returns number of downloaded objects (best-effort; we parse ls).
+    """
+    if not _gsutil_ok():
+        raise RuntimeError("gsutil not found. Please install the Google Cloud SDK or add gsutil to PATH.")
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    # Count remote objects (best-effort)
+    try:
+        ls_out = subprocess.check_output(["gsutil", "ls", "-r", gs_uri], text=True, stderr=subprocess.STDOUT)
+        objs = [line for line in ls_out.splitlines() if line.startswith("gs://") and not line.endswith("/")]
+        count_before = len(objs)
+    except Exception:
+        count_before = 0
+
+    # Sync down
+    subprocess.check_call(["gsutil", "-m", "rsync", "-r", gs_uri, str(local_dir)])
+    return count_before
+
+def _rsync_up(local_dir: Path, gs_uri: str) -> int:
+    """
+    Upload *entire* local_dir to prefix using gsutil -m rsync -r.
+    Returns number of local files uploaded (best-effort).
+    """
+    if not _gsutil_ok():
+        raise RuntimeError("gsutil not found. Please install the Google Cloud SDK or add gsutil to PATH.")
+
+    # Count local files (best-effort)
+    count_local = sum(1 for _ in local_dir.rglob("*") if _.is_file())
+    subprocess.check_call(["gsutil", "-m", "rsync", "-r", str(local_dir), gs_uri])
+    return count_local
+
+def run_with_gcs(config_path_str: str, process_fn, input_date: Optional[str]) -> Dict[str, Any]:
+    """
+    - Mirrors the entire ROOT_PATH prefix to a temp dir
+    - Calls process_fn(local_config_path)
+    - Pushes any changes (esp. outputs) back to the same prefix
+    - Returns stats + GCS transfer info
+    """
+    root_uri = os.environ.get("ROOT_PATH")
+    if not root_uri:
+        raise RuntimeError("ROOT_PATH not set. Export ROOT_PATH to your gs:// prefix.")
+    if not root_uri.startswith("gs://"):
+        raise RuntimeError(f"ROOT_PATH must be a gs:// URI, got: {root_uri}")
+
+    # Make a unique temp workspace
+    tmp_root = Path(tempfile.gettempdir()) / f"gcs_mirror_{uuid.uuid4().hex}"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+
+    # Mirror down
+    print(f"[INFO] Mirroring down from {root_uri} -> {tmp_root}")
+    downloaded = _rsync_down(root_uri, tmp_root)
+
+    # Resolve local config path (always <tmp_root>/config.json)
+    local_cfg = (tmp_root / "config.json").resolve()
+    if not local_cfg.exists():
+        raise FileNotFoundError(f"config.json not found in {root_uri}. Expected at {root_uri}/config.json")
+
+    # Run your unchanged logic
+    stats = process_fn(local_cfg)
+
+    # Push up everything (so outputs under cfg['output'] get synced)
+    print(f"[INFO] Syncing outputs back to {root_uri} from {tmp_root}")
+    uploaded = _rsync_up(tmp_root, root_uri)
+
+    # Annotate stats
+    stats["gcs_downloaded"] = downloaded
+    stats["gcs_uploaded"] = uploaded
+    stats["gcs_tmp_root"] = str(tmp_root)
+
+    # NOTE: We do NOT delete tmp_root so you can inspect if needed. Uncomment to clean up:
+    # shutil.rmtree(tmp_root, ignore_errors=True)
+
+    return stats
+
+# =======================================================================
+#                                M A I N
+# =======================================================================
+def main(input_date: Optional[str] = None):
     if input_date:
         print(f"[INFO] Using date prefix: {input_date}")
 
-    cfg_path_str = root.rstrip("/") + "/config.json"
-    print(f"[INFO] Using config path: {cfg_path_str}")
-    # Always run via GCS bridge (no local fallback)
+    # Require ROOT_PATH to be gs://... (GCS-only mode)
+    root = os.environ.get("ROOT_PATH", "").strip()
+    if not root or not root.startswith("gs://"):
+        print("[ERROR] GCS-only mode: export ROOT_PATH to a gs:// prefix.", file=sys.stderr)
+        print("Example:", file=sys.stderr)
+        print('  export ROOT_PATH="gs://qa-automation-test_x35-dev/sales_invoice_kibana_logs/my-test-2025-09-05"', file=sys.stderr)
+        sys.exit(1)
+
+    # config path is always ROOT_PATH/config.json, but we pass a string for parity
+    cfg_path_str = expand_env_str(CONFIG_TEMPLATE)
+
     try:
-        stats = run_with_optional_gcs(
+        stats = run_with_gcs(
             config_path_str=cfg_path_str,
             process_fn=lambda local_cfg_path: process(local_cfg_path, input_date=input_date),
+            input_date=input_date,
         )
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] gsutil command failed: {e}", file=sys.stderr)
+        sys.exit(2)
     except Exception as e:
-        print(f"[ERROR] GCS run failed: {e}", file=sys.stderr)
-        sys.exit(1)
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(3)
 
     print(f"\nScanned: {stats.get('files_scanned', 0)} JSON files")
     print(f"Total records written: {stats.get('hits', 0)}")
-    if "gcs_downloaded" in stats or "gcs_uploaded" in stats:
-        print(f"GCS downloaded: {stats.get('gcs_downloaded', 0)}, uploaded: {stats.get('gcs_uploaded', 0)}")
-        print(f"Temp mirror: {stats.get('gcs_tmp_root', '-')}")
-    return stats
+    print(f"GCS downloaded: {stats.get('gcs_downloaded', 0)}, uploaded: {stats.get('gcs_uploaded', 0)}")
+    print(f"Temp mirror: {stats.get('gcs_tmp_root', '-')}")
 
 if __name__ == "__main__":
-    # Optional CLI support: python main.py 2025-08-25
     arg_date = sys.argv[1] if len(sys.argv) > 1 else None
     main(arg_date)
